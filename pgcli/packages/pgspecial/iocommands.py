@@ -129,7 +129,7 @@ def list_named_queries(verbose):
         rows = [[r, namedqueries.get(r)] for r in namedqueries.list()]
 
     if not rows:
-        status = namedqueries.usage
+        status = '\nNo named queries found.' + namedqueries.usage
     else:
         status = ''
     return [('', rows, headers, status)]
