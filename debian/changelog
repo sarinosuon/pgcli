@@ -1,0 +1,6 @@
+pgcli (0.18.0) unstable; urgency=low
+
+  * c75f740 Change style for completion meta entries.
+
+
+ -- Amjith <amjith.r@gmail.com>  Fri, 10 Jul 2015 18:33:29 +0000
