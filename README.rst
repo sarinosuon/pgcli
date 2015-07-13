@@ -129,8 +129,41 @@ If pip is not installed check if easy_install is available on the system.
 
     $ sudo easy_install pgcli
 
-Linux:
-======
+Debian/Ubuntu:
+==============
+
+The debian package for pgcli is hosted on packagecloud.io.
+
+Add the gpg key for packagecloud for package verification.
+
+::
+    
+    $ curl https://packagecloud.io/gpg.key | apt-key add -
+    
+Install a package called apt-transport-https to make it possible for apt to fetch packages over https.
+
+::
+
+    $ apt-get install -y apt-transport-https
+
+Add the pgcli package repo to the apt source.
+
+::
+
+    $ deb https://packagecloud.io/amjith/pgcli/ubuntu/ trusty main
+    $ deb-src https://packagecloud.io/amjith/pgcli/ubuntu/ trusty main
+
+Update and apt sources and install pgcli.
+
+::
+
+    $ sudo apt-get update
+    $ sudo apt-get install pgcli
+
+Now ``pgcli`` can be updagraded easily by using ``sudo apt-get upgrade pgcli``.
+
+RHEL, Centos, Fedora:
+=====================
 
 In depth getting started guide for ``pip`` - https://pip.pypa.io/en/latest/installing.html.
 
@@ -145,10 +178,6 @@ might look something like:
 
 ::
 
-    $ sudo apt-get install python-pip   # Debian, Ubuntu, Mint etc
-
-    or
-
     $ sudo yum install python-pip  # RHEL, Centos, Fedora etc
 
 ``pgcli`` requires python-dev, libpq-dev and libevent-dev packages. You can
@@ -156,10 +185,6 @@ install these via your operating system package manager.
 
 
 ::
-
-    $ sudo apt-get install python-dev libpq-dev libevent-dev
-
-    or 
 
     $ sudo yum install python-devel postgresql-devel
 
