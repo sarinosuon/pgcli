@@ -1,4 +1,4 @@
 #!/bin/bash
 
 echo "Setting up symlink to pgcli"
-ln -sf /usr/share/pgcli/bin/pgcli /usr/local/bin/pgcli
+ln -sf /usr/share/python/pgcli/bin/pgcli /usr/local/bin/pgcli
