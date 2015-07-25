@@ -150,8 +150,7 @@ Add the pgcli package repo to the apt source.
 
 ::
 
-    $ deb https://packagecloud.io/amjith/pgcli/ubuntu/ trusty main
-    $ deb-src https://packagecloud.io/amjith/pgcli/ubuntu/ trusty main
+    $ echo "deb https://packagecloud.io/amjith/pgcli/ubuntu/ trusty main" | sudo tee -a /etc/apt/sources.list
 
 Update and apt sources and install pgcli.
 
