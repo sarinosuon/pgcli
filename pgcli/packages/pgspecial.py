@@ -1,8 +1,12 @@
 from __future__ import print_function
+import re
+import os
 import sys
 import logging
 from collections import namedtuple
 from .tabulate import tabulate
+
+from pgcli import shared
 
 TableInfo = namedtuple("TableInfo", ['checks', 'relkind', 'hasindex',
 'hasrules', 'hastriggers', 'hasoids', 'tablespace', 'reloptions', 'reloftype',
@@ -1025,6 +1029,245 @@ def toggle_timing(cur, arg, verbose):
     message += "on." if TIMING_ENABLED else "off."
     return [(None, None, None, message)]
 
+
+def list_macros(cur, arg, verbose):
+    for name, (_fun, _lambda_code, full_code) in sorted(  shared.macros.items()  ):
+        print("=== " + full_code + "\n\n")
+    return []
+
+def load_file(cur, arg, verbose):
+    if os.path.isfile(arg):
+        print("YES:", arg)
+    return []
+
+def save_macros(cur, arg, verbose):
+    full = os.path.join(os.getenv("HOME"), ".pgcli-macros.pg")
+    fout = open(full, 'wb')
+    for name, (_fun, _lambda_code, full_code) in sorted(  shared.macros.items()  ):
+        fout.write("=== " + full_code + "\n\n")
+    fout.close()
+    return []
+
+
+def load_macros(cur, arg, verbose):
+    curr_lines = []
+
+    full = os.path.join(os.getenv("HOME"), ".pgcli-macros.pg")
+    if os.path.exists(full):
+        fin = open(full, 'rb')
+        while 1:
+            line = fin.readline()
+            if not line: break
+            if not line.strip():
+                continue
+            line = line.rstrip()
+            if line.startswith('=== '):
+                if curr_lines:
+                    input = "\n".join(curr_lines)
+                    name, fun, lambda_code = get_lambda(input, shared.info)
+                    if name:
+                        shared.macros[name] = (fun, lambda_code, input)
+                curr_lines = [line[4:]]
+            else:
+                curr_lines.append(line)
+        fin.close()
+
+        if curr_lines:
+            input = "\n".join(curr_lines)
+            name, fun, lambda_code = get_lambda(input, shared.info)
+            if name:
+                shared.macros[name] = (fun, lambda_code, input)
+    return []
+
+def clear_macros(cur, arg, verbose):
+    shared.macros = {}
+
+def clear_results(cur, arg, verbose):
+    shared._it = {}
+    return []
+
+def clear_all(cur, arg, verbose):
+    from hsdl.common import general
+    clear_results(cur, arg, verbose)
+    path = general.interpolate_filename("${HOME}/pgcli/data")
+    if os.path.exists(path):
+        for fname in os.listdir(path):
+            full = os.path.join(path, fname)
+            os.unlink(full)
+    return []
+
+def interpolate(code, macros):
+    invoke_pat = re.compile(r'@(?P<name>[a-zA-Z0-9_]+)\((?P<args>[^)]+)?\)')
+    def sub(matchobj):
+        name = matchobj.group('name')
+        args = matchobj.group('args')
+        if args is None:
+            args = ""
+        return '""" + subinterp(macros, "%s", %s) + """' % (name, args)
+    code2 = '"""' + invoke_pat.sub(sub, code) + '"""'
+    return code2
+
+
+def subinterp(info, name, *args):
+    if name in info['macros']:
+        fun = info['macros'][name][0]
+        arity = fun.func_code.co_argcount
+        if len(args) != arity:
+            raise TypeError("%s() takes exactly %d arguments (%d given)" % (name, arity, len(args)))
+        else:
+            result = apply(fun, args).strip()
+            if result and result[-1] == ';':
+                result = result[:-1]
+
+            num_semis = result.count(";")
+            if num_semis == 0:
+                return "(" + result + ")"
+            else:
+                # this likely means it combines select and manipulation
+                return result
+    else:
+        raise NameError("macro '%s' is not defined" % (name, ))
+
+
+def simple_invoke(body):
+        invoke_pat = re.compile(r'@(?P<name>[a-zA-Z0-9_]+)\((?P<args>[^)]+)?\)')
+
+        def invoke_sub(matchobj):
+            name = matchobj.group('name')
+            args = matchobj.group('args')
+            if args is None:
+                args = ""
+            spec = matchobj.group().strip()[:1] # remove "@" at front
+            return '''""" +  info['subinterp'](info, '%s', %s) + """'''  % (name, args)
+
+        r2 = invoke_pat.search(body)
+        if r2:
+            core = '"""' + invoke_pat.sub(invoke_sub, body).strip() + '"""'
+
+        return core #(name, eval(to_eval, {'info': info}), to_eval)
+
+var_pat = re.compile('{{(?P<expr>[^}]+)}}')
+
+# Unlike the slots in get_lambda (see below), which are eval'ed as part of one big eval, each slot is eval'ed separately within a sql string.
+# This should not be called in the case of a "def".
+
+def eval_python_slots(sql, info):
+    def var_sub(matchobj):
+        spec = matchobj.group('expr').strip()
+        return clean_for_sql_insertion(eval(spec, info))
+
+    result = var_pat.sub(var_sub, sql)
+    return result
+
+
+def get_lambda(code, info):
+    defn_pat = re.compile(r'def\s+(?P<name>[a-zA-Z0-9_]+)\((?P<args>[^)]+)?\)\s*=(?P<body>.+)', re.DOTALL)
+    invoke_pat = re.compile(r'@(?P<name>[a-zA-Z0-9_]+)\((?P<args>[^)]+)?\)')
+
+    r = defn_pat.search(code)
+    if r:
+        name = r.group('name')
+        args = r.group('args')
+        if args is None:
+            args = ""
+        body = r.group('body')
+
+
+        spec_expressions = []
+        def var_sub(matchobj):
+            spec = matchobj.group('expr').strip()
+            spec_expressions.append('_clean(' + spec + ')')
+            return '%s'
+
+        args_str = r.group('args')
+        if args_str is None:
+            args_str = ""
+
+        core = var_pat.sub(var_sub, body)
+
+        def invoke_sub(matchobj):
+            name = matchobj.group('name')
+            args = matchobj.group('args')
+            if args is None:
+                args = ""
+            spec = matchobj.group().strip()[:1] # remove "@" at front
+            return '''""" +  info['subinterp'](info, '%s', %s) + """'''  % (name, args)
+
+        r2 = invoke_pat.search(body)
+        if r2:
+            core = '"""' + invoke_pat.sub(invoke_sub, core).strip() + '"""'
+            to_eval = '''lambda %s : (%s) %% (%s)   ''' % (args_str, core, ",".join(spec_expressions))
+        else:
+            to_eval = '''lambda %s : ("""%s""") %% (%s)   ''' % (args_str, core, ",".join(spec_expressions))
+
+        #return (name, eval(to_eval, {'info': info}), to_eval)
+        return (name, eval(to_eval, info), to_eval)
+
+    return ('', None, '')
+
+def check_invoke_macro(code, macros):
+    env = {k:v[0] for k,v in macros.items()}    # extract first item in tuple, which is the lambda object
+    invoke_pat = re.compile(r'@(?P<name>[a-zA-Z0-9_]+)\((?P<args>[^)]+)?\)')
+
+    def sub(matchobj):
+        subcode = matchobj.group().strip()[1:] # remove "@"
+        result = eval(subcode, env).strip()
+        if result[-1] == ";":
+            result = result[:-1]
+            r = invoke_pat.search(result)
+            if r:
+                result = check_invoke_macro(result, macros)
+        return " ( " + result + ") "
+
+    def sub_highlight(matchobj):
+        subcode = matchobj.group().strip()[1:] # remove "@"
+        r = eval(subcode, env).strip()
+        if r[-1] == ";":
+            r = r[:-1]
+        return " ( " + chr(27) + '[1;33m' + r + chr(27) + '[1;37m' + ") "
+
+    final_code = invoke_pat.sub(sub, code)
+    final_code_highlighted = invoke_pat.sub(sub_highlight, code)
+    print(final_code_highlighted)
+    return final_code
+
+
+class LiteralString:
+    def __init__(self, literal_string):
+        self.literal_string = literal_string
+
+    def get_literal_string(self):
+        return self.literal_string
+
+
+def clean_for_sql_insertion(obj, force_quoted = False):
+    if obj is None:
+        return 'NULL'
+    elif isinstance(obj, str) or isinstance(obj, unicode):
+        if force_quoted:
+            return "'" + obj + "'"
+        else:
+            return obj
+    elif isinstance(obj, list):
+        return '(' +  ",".join([clean_for_sql_insertion(each, force_quoted = True) for each in obj])  +  ')'
+    if isinstance(obj, LiteralString):
+        return obj.get_literal_string()
+    else:
+        return str(obj)
+
+# _or('x =', [1,2,3,4,5])
+def sql_helper_or(prefix, items):
+    clauses = ['(' + prefix + ' ' + clean_for_sql_insertion(each, force_quoted = True) + ')'   for each in items]
+    return LiteralString(" OR ".join(clauses))
+
+def sql_helper_and(prefix, items):
+    clauses = ['(' + prefix + ' ' + clean_for_sql_insertion(each, force_quoted = True) + ')'   for each in items]
+    return LiteralString(" AND ".join(clauses))
+
+def sql_helper_between(prefix, op, items):
+    clauses = ['(' + prefix + ' ' + clean_for_sql_insertion(each, force_quoted = True) + ')'   for each in items]
+    return LiteralString((" " + op.strip() + " ").join(clauses))
+
 CASE_SENSITIVE_COMMANDS = {
             '\?': (show_help, ['\?', 'Help on pgcli commands.']),
             '\c': (dummy_command, ['\c database_name', 'Connect to a new database.']),
@@ -1043,6 +1286,13 @@ CASE_SENSITIVE_COMMANDS = {
             '\e': (dummy_command, ['\e [file]', 'Edit the query buffer (or file) with external editor.']),
             '\ef': (in_progress, ['\ef [funcname [line]]', 'Not yet implemented.']),
             '\sf': (in_progress, ['\sf[+] funcname', 'Not yet implemented.']),
+
+            '\msave': (save_macros, ['\msave', 'Save macros.']),
+            '\mload': (load_macros, ['\mload', 'Load macros.']),
+            '\clear': (clear_results, ['\clear', 'Clear results table.']),
+            '\clearall': (clear_all, ['\clearall', 'Clear all (results table and serialized data).']),
+            '\mlist': (list_macros, ['\mlist', 'List macros.']),
+
             '\z': (in_progress, ['\z [pattern]', 'Not yet implemented.']),
             '\do': (in_progress, ['\do[S] [pattern]', 'Not yet implemented.']),
             }

@@ -8,8 +8,13 @@ from collections import namedtuple
 from decimal import Decimal
 from platform import python_version_tuple
 from wcwidth import wcswidth
-import re
 
+import os
+import re
+import cPickle
+import traceback
+
+from pgcli import shared
 
 if python_version_tuple()[0] < "3":
     from itertools import izip_longest
@@ -261,7 +266,8 @@ _table_formats = {"simple":
 tabulate_formats = list(sorted(_table_formats.keys()))
 
 
-_invisible_codes = re.compile(r"\x1b\[\d*m|\x1b\[\d*\;\d*\;\d*m")  # ANSI color codes
+#_invisible_codes = re.compile(r"\x1b\[\d*m|\x1b\[\d*\;\d*\;\d*m")  # ANSI color codes
+_invisible_codes =  re.compile(r"\x1b\[\d*;\d*m")
 _invisible_codes_bytes = re.compile(b"\x1b\[\d*m|\x1b\[\d*\;\d*\;\d*m")  # ANSI color codes
 
 
@@ -522,7 +528,10 @@ def _format(val, valtype, floatfmt, missingval=""):
         except TypeError:
             return _text_type(val)
     elif valtype is float:
-        return format(float(val), floatfmt)
+        if is_string(val):
+            return val
+        else:
+            return format(float(val), floatfmt)
     else:
         return "{0}".format(val)
 
@@ -647,6 +656,111 @@ def _normalize_tabular_data(tabular_data, headers):
            headers = [""]*(ncols - nhs) + headers
 
     return rows, headers
+
+# convert list of lists into list of dicts, with each column keyed by respective header names
+def make_dict_table(headers, list_of_lists):
+    full = []
+    rr = range(len(headers))
+    for row in list_of_lists:
+        d = {headers[i]:row[i] for i in rr}
+        full.append(d)
+    return full
+
+def is_string(x):
+    return isinstance(x, str) or isinstance(x, unicode)
+
+def check_colorize_formula(color_specs, col_name, val):
+    ret = val
+    for each in color_specs:
+        if isinstance(each, tuple):
+            if len(each) == 2:
+                print(each)
+                if is_string(each[0]):
+                    if col_name == 'date':
+                        return '\x1b[1;37m\x1b[0;37m\x1b[1;31m' + str(val) + '\x1b[0;37m'
+                    if each[0] == col_name:
+                        cond = each[1]
+                        # special casting for boolean
+                        if isinstance(val, bool) and is_string(cond):
+                            val = str(val)
+                        if val is None and is_string(cond):
+                            val = '<null>'
+                        if val == cond:
+                            return '\x1b[1;37m\x1b[0;37m\x1b[1;31m' + str(val) + '\x1b[0;37m'
+                        elif callable(cond):
+                            if cond(val):
+                                return '\x1b[1;37m\x1b[0;37m\x1b[1;31m' + str(val) + '\x1b[0;37m'
+    return ret
+
+COLOR_DICT = {'gray' : 30,
+              'red' : 31,
+              'green' : 32,
+              'yellow' : 33,
+              'blue' : 34,
+              'purple' : 35,
+              'cyan' : 36,
+              'white' : 37}
+
+def check_colorize_formula(color_specs, col_name, val):
+    ret = val
+    for each in color_specs:
+        if isinstance(each, tuple):
+            if len(each) >= 2:
+                if is_string(each[0]):
+                    if each[0] == col_name:
+                        if len(each) > 2:
+                            color = each[2]
+                        else:
+                            color = 'red'
+                        cond = each[1]
+                        # special casting for booleans and nulls
+                        if isinstance(val, bool) and is_string(cond):
+                            val = str(val)
+                        if val is None and is_string(cond):
+                            val = '<null>'
+                        if val == cond:
+                            return '\x1b[1;37m\x1b[0;37m\x1b[1;' + str(COLOR_DICT[color]) + 'm' + str(val) + '\x1b[0;37m'
+                        elif callable(cond):
+                            if cond(val):
+                                return '\x1b[1;37m\x1b[0;37m\x1b[1;' + str(COLOR_DICT[color]) + 'm' + str(val) + '\x1b[0;37m'
+    return ret
+
+def colorize_data(headers, list_of_lists):
+    rr = range(len(headers))
+    for row in list_of_lists:
+        for i in range(len(row)):
+            col_name = headers[i]
+            val = row[i]
+            if (not shared.local_color_specs) or shared.local_color_specs_add_to_default:
+                all_color_specs = shared.default_color_specs + shared.local_color_specs
+            else:
+                all_color_specs = shared.local_color_specs
+            # attempt to colorize
+            val = check_colorize_formula(all_color_specs, col_name, val)
+            row[i] = val
+    return list_of_lists, headers
+
+
+def pickle_data(var_name, headers, table, entered_code, executed_sql):
+    from hsdl.common import general
+    path = general.interpolate_filename("${HOME}/pgcli/data")
+    if os.path.exists(path):
+        z = cPickle.dumps( (headers, table) )
+        full_data = os.path.join(path, var_name + '.pickle')
+        full_code = os.path.join(path, var_name + '.entered')
+        full_sql = os.path.join(path, var_name + '.sql')
+
+        fout = open(full_data, 'wb')
+        fout.write(z)
+        fout.close()
+
+        fout = open(full_code, 'wb')
+        fout.write(entered_code + "\n")
+        fout.close()
+
+        fout = open(full_sql, 'wb')
+        fout.write(executed_sql + "\n")
+        fout.close()
 
 
 def tabulate(tabular_data, headers=[], tablefmt="simple",
@@ -880,9 +994,32 @@ def tabulate(tabular_data, headers=[], tablefmt="simple",
     \\bottomrule
     \end{tabular}
     """
+
     if tabular_data is None:
         tabular_data = []
     list_of_lists, headers = _normalize_tabular_data(tabular_data, headers)
+
+    shared.table = make_dict_table(headers, list_of_lists)
+    shared.headers = headers
+    if shared._it_var_name:
+        var_name = shared._it_var_name
+        to_pickle = False
+
+        if var_name.endswith('!'):
+            var_name = var_name[:-1]
+            to_pickle = True
+
+        shared._it[var_name] = shared.table
+        shared._it_entered_code[var_name] = shared.entered_code
+        shared._it_executed_sql[var_name] = shared.executed_sql
+
+        if to_pickle:
+            pickle_data(var_name, headers, shared.table, shared.entered_code, shared.executed_sql)
+
+    try:
+        list_of_lists, headers = colorize_data(headers, list_of_lists)
+    except Exception as e:
+        traceback.print_exc()
 
     # optimization: look for ANSI control codes once,
     # enable smart width functions only if a control code is found

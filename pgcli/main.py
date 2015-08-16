@@ -5,7 +5,11 @@ from __future__ import print_function
 import os
 import sys
 import traceback
+from io import StringIO
 import logging
+import atexit
+import re
+
 from time import time
 
 import click
@@ -18,12 +22,23 @@ from prompt_toolkit.layout.processors import HighlightMatchingBracketProcessor
 from prompt_toolkit.layout.prompt import DefaultPrompt
 from prompt_toolkit.history import FileHistory
 from pygments.lexers.sql import PostgresLexer
+from pygments import highlight
+#from pygments.lexers import PostgresLexer
+from pygments.formatters import Terminal256Formatter
+
 from pygments.token import Token
 
 from .packages.tabulate import tabulate
 from .packages.expanded import expanded_table
 from .packages.pgspecial import (CASE_SENSITIVE_COMMANDS,
         NON_CASE_SENSITIVE_COMMANDS, is_expanded_output)
+
+from .packages.pgspecial import save_macros
+from .packages.pgspecial import load_macros
+from .packages.pgspecial import get_lambda
+from .packages.pgspecial import simple_invoke
+from .packages.pgspecial import check_invoke_macro
+
 import pgcli.packages.pgspecial as pgspecial
 import pgcli.packages.iospecial as iospecial
 from .pgcompleter import PGCompleter
@@ -36,6 +51,7 @@ from .key_bindings import pgcli_bindings
 from .encodingutils import utf8tounicode
 from .__init__ import __version__
 
+import shared
 
 try:
     from urlparse import urlparse
@@ -56,6 +72,8 @@ class PGCli(object):
         self.force_passwd_prompt = force_passwd_prompt
         self.never_passwd_prompt = never_passwd_prompt
         self.pgexecute = pgexecute
+
+        load_macros(None,None,None)
 
         from pgcli import __file__ as package_root
         package_root = os.path.dirname(package_root)
@@ -116,6 +134,17 @@ class PGCli(object):
         self.connect(database, uri.hostname, uri.username,
                      uri.port, uri.password)
 
+    # return None if format was not correct
+    def extract_user_input(self, sql):
+        p = sql.find('# Type your query below this line')
+        if p >= 0:
+            p2 = sql.find('# Type your query above this line')
+            if p2 >= 0:
+                lines = sql[p:p2].split("\n")[1:]  # ignore the first line
+                return "\n".join(lines).rstrip()
+
+        return None
+
     def connect(self, database='', host='', user='', port='', passwd=''):
         # Connect to the database.
 
@@ -159,7 +188,7 @@ class PGCli(object):
             self.logger.debug('Database connection failed: %r.', e)
             self.logger.error("traceback: %r", traceback.format_exc())
             click.secho(str(e), err=True, fg='red')
-            exit(1)
+            sys.exit(1)
 
         self.pgexecute = pgexecute
 
@@ -176,19 +205,87 @@ class PGCli(object):
         :param document: Document
         :return: Document
         """
+        the_text = document.text
+        the_text = "\n".join(cli.current_buffer._history.strings)
         while iospecial.editor_command(document.text):
             filename = iospecial.get_filename(document.text)
             sql, message = iospecial.open_external_editor(filename,
-                                                          sql=document.text)
+                                                          sql=the_text)
+
+
             if message:
                 # Something went wrong. Raise an exception and bail.
                 raise RuntimeError(message)
+
+            extract = self.extract_user_input(sql)
+            if extract is None:
+                continue
+            else:
+                sql = extract
+
             cli.current_buffer.document = Document(sql, cursor_position=len(sql))
             document = cli.read_input(False)
             continue
         return document
 
-    def run_cli(self):
+    def display_colorized_sql(self, sql):
+        print(highlight(sql, PostgresLexer(), Terminal256Formatter()))
+
+    def get_color_specs_helper(self, main):
+        colors = ['red', 'green', 'yellow', 'blue', 'purple', 'cyan', 'white']
+        col_pat = re.compile(r'(?P<col_name>[^:/]+):(?P<subspecs>[^/]+)')
+
+        full = []
+
+        col_specs = col_pat.findall(main)
+        for col_name, col_spec_main in col_specs:
+            col_specs = [each.strip() for each in col_spec_main.split("~")]
+            color = 0
+            for col_spec in col_specs:
+                if col_spec.strip():
+                    cases = [each.strip() for each in col_spec.split("|")]
+                    for case in cases:
+                        full.append((col_name, case, colors[color]))
+                color += 1
+
+        return full
+
+    # returns (array of specs (otherwise []),  True/False to add to default colors)
+    def get_color_specs(self, text):
+        full = []
+        add_to_default = False
+
+        ref_pat = re.compile(r"--'\s*(?P<add_maybe>\+)?color\s*=>\s*(?P<rest>.+)'")
+        main_pat = re.compile(r"--'\s*(?P<add_maybe>\+)?color\s*=\s*(?P<rest>.+)'")
+
+        r = ref_pat.search(text)
+        if r:
+            if r.group('add_maybe'):
+                add_to_default = True
+            refs_str = r.group('rest').strip()
+            refs = [ref.strip() for ref in refs_str.split(",")]
+            for ref in refs:
+                if ref in shared.color_specs:
+                    main = shared.color_specs[ref]
+                    full += self.get_color_specs_helper(main)
+                elif ('+' + ref) in shared.color_specs:
+                    main = shared.color_specs['+' + ref]
+                    full += self.get_color_specs_helper(main)
+                else:
+                    raise Exception("Cannot find color_spec '%s'" % ref)
+        else:
+            r = main_pat.search(text)
+            #---'color=name@cash on hand|Office supplies~VAT input~Custom tax//ucode~~115020';
+            if r:
+                main = r.group('rest').strip()
+                if r.group('add_maybe'):
+                    add_to_default = True
+
+                full += self.get_color_specs_helper(main)
+
+        return full, add_to_default
+
+    def run_cli(self, say_bye = True):
         pgexecute = self.pgexecute
         logger = self.logger
         original_less_opts = self.adjust_less_opts()
@@ -200,6 +297,27 @@ class PGCli(object):
         print('Chat: https://gitter.im/dbcli/pgcli')
         print('Mail: https://groups.google.com/forum/#!forum/pgcli')
         print('Home: http://pgcli.com')
+
+        # ============== preparation ================================
+        for name, spec_str in shared.color_specs.items():
+            specs = self.get_color_specs_helper(spec_str)
+            if name.startswith('+'):
+                shared.default_color_specs += specs
+
+        for mod in "random string sys os glob time uuid re".split():
+            shared.info[mod] = __import__(mod)
+
+        import sbox
+        reload(sbox)
+        shared.info["sbox"] = sbox
+
+        try:
+            shared.info["shared"] = shared
+            from hsdl.common import general
+            shared.info["general"] = general
+        except:
+            pass
+        # ==========================================================
 
         def prompt_tokens(cli):
             return [(Token.Prompt,  '%s> ' % pgexecute.dbname)]
@@ -252,16 +370,144 @@ class PGCli(object):
                     # if an exception occurs in pgexecute.run(). Which causes
                     # finally clause to fail.
                     res = []
-                    start = time()
+                    orig_start = time()
+
+                    the_text = document.text
+
+                    shared.entered_code = ''      # this gets filled in
+                    shared.executed_sql = ''      # this gets filled in
+
+                    # load file
+                    if the_text.strip().startswith("?!"):
+                        path = the_text.strip()[2:].strip()
+                        path = path.replace(";", "").strip()
+                        if os.path.isfile(path):
+                            fin = open(path, 'rb')
+                            the_text = fin.read()
+                            fin.close()
+                            self.display_colorized_sql(the_text)
+                        else:
+                            print("File does not exist")
+                            continue
+
+
+                    elif the_text.strip().startswith("??"):
+                        the_text = the_text.strip()
+                        if the_text.endswith(';'):
+                            the_text = the_text[:-1]
+                        parts = the_text.split()
+                        if len(parts) > 1:
+                            the_text = ";\n".join(["select * from " + tab for tab in parts[1:]]) + ";"
+                            self.display_colorized_sql(the_text)
+                        else:
+                            print("Invalid ?? command; please table name(s)")
+                            continue
+
+                    elif the_text.strip().startswith("?#"):
+                        the_text = the_text.strip()
+                        if the_text.endswith(';'):
+                            the_text = the_text[:-1]
+                        parts = the_text.split()
+                        if len(parts) > 1:
+                            the_text = ";\n".join([("\\d " + tab + "; select count(*) from " + tab) for tab in parts[1:]]) + ";"
+                            self.display_colorized_sql(the_text)
+                        else:
+                            print("Invalid ?? command; please table name(s)")
+                            continue
+
+
+                        path = the_text.strip()[2:].strip()
+                        path = path.replace(";", "").strip()
+                        if os.path.isfile(path):
+                            fin = open(path, 'rb')
+                            the_text = fin.read()
+                            fin.close()
+                            self.display_colorized_sql(the_text)
+
+
+                    local_color_specs = []
+                    add_to_default = False
+
+                    try:
+                        local_color_specs, add_to_default = self.get_color_specs(the_text)
+                    except Exception as e:
+                        traceback.print_exc()
+                        raise e
+
+                    shared.local_color_specs = local_color_specs
+
+                    # if no color specs were provided, leave the decision to add to defaults alone
+                    if local_color_specs:
+                        shared.local_color_specs_add_to_default = add_to_default
+
+                    macro_invoke_pat = re.compile(r'@(?P<name>[a-zA-Z0-9_]+)\((?P<args>[^)]+)?\)')
+                    assign_pat = re.compile(r'^(?P<name>[a-zA-Z0-9_]+!?)\s*=\s*', re.DOTALL)
+
                     # Run the query.
-                    res = pgexecute.run(document.text)
-                    duration = time() - start
+                    if the_text.strip().startswith('def '):
+
+                        name, fun, lambda_code = get_lambda(the_text, shared.info)
+                        if name:
+                            shared.macros[name] = (fun, lambda_code, the_text)
+                            #shared.macros[name] = (fun, code, the_text)
+                            #save_macros(None,None,None)    # TODO
+                            #print("???????????", the_text)
+                            #for name, (fun, code) in sorted(shared.macros.items()):
+                            #    print(name,":",code)
+                            continue
+                    else:
+                        the_text = the_text.strip()
+
+                        r = assign_pat.search(the_text)
+                        shared._it_var_name = ''
+
+                        if r:
+                            shared._it_var_name = r.group('name')
+                            the_text = the_text[r.end():].strip()
+
+                        # see if we can do some {{ }} interpolation
+
+                        text_after_interpolation = pgspecial.eval_python_slots(the_text, shared.info)
+                        shared.entered_code = the_text
+
+                        if text_after_interpolation != the_text:
+                            self.display_colorized_sql(text_after_interpolation)
+                            the_text = text_after_interpolation
+
+                        try:
+                            shared.info['macros'] = shared.macros
+                            shared.info['subinterp'] = pgspecial.subinterp
+                            shared.info['info'] = shared.info
+                            shared.info['_clean'] = pgspecial.clean_for_sql_insertion
+                            shared.info['_OR'] = pgspecial.sql_helper_or
+                            shared.info['_AND'] = pgspecial.sql_helper_and
+                            shared.info['_BETWEEN'] = pgspecial.sql_helper_between
+                            r = macro_invoke_pat.search(the_text)
+                            if r:
+                                res = eval(simple_invoke(the_text), shared.info, shared.info)
+                                self.display_colorized_sql(res)
+                                #name, fun, code = get_lambda(input, shared.info)
+                                #res = check_invoke_macro(the_text.strip(), shared.macros)
+                                if res:
+                                    the_text = res
+
+                            if the_text.startswith('?'):
+                                the_text = ''
+
+                        except Exception as e:
+                            traceback.print_exc()
+
+
+                    # squirrel this away for later
+                    shared.executed_sql = the_text
+
+                    res = pgexecute.run(the_text)
                     successful = True
                     output = []
                     total = 0
                     for title, cur, headers, status in res:
                         logger.debug("headers: %r", headers)
-                        logger.debug("rows: %r", cur)
+                        logger.debug("table:", self.table_format)
                         logger.debug("status: %r", status)
                         start = time()
                         threshold = 1000
@@ -272,6 +518,7 @@ class PGCli(object):
                             if not click.confirm('Do you want to continue?'):
                                 click.secho("Aborted!", err=True, fg='red')
                                 break
+
                         output.extend(format_output(title, cur, headers,
                             status, self.table_format))
                         end = time()
@@ -307,6 +554,7 @@ class PGCli(object):
                 else:
                     click.echo_via_pager('\n'.join(output))
                     if pgspecial.TIMING_ENABLED:
+                        duration = time() - orig_start
                         print('Command Time:', duration)
                         print('Format Time:', total)
 
@@ -324,7 +572,8 @@ class PGCli(object):
                 self.query_history.append(query)
 
         except EOFError:
-            print ('Goodbye!')
+            if say_bye:
+                print ('Goodbye!')
         finally:  # Reset the less opts back to original.
             logger.debug('Restoring env var LESS to %r.', original_less_opts)
             os.environ['LESS'] = original_less_opts
@@ -414,6 +663,24 @@ def cli(database, user, host, port, prompt_passwd, never_prompt, dbname,
             '\tport: %r', database, user, host, port)
 
     pgcli.run_cli()
+
+def pg(username, password, server, port, db):
+    pgcli = PGCli(False, False)
+    pgcli.connect_uri("postgresql://%s:%s@%s:%s/%s" % (username, password, server, port, db))
+    pgcli.run_cli(say_bye = False)
+
+# Utility for quick development of pgcli interpreter. Start in python repl, run rehash().
+# Try new code in pgcli repl. Press ctl-D, re-enter python repl, re-run rehash() to try
+# new code.
+def rehash():
+    from pgcli.packages import pgspecial
+    reload(pgspecial)
+    from pgcli import shared
+    reload(shared)
+    from pgcli import main
+    reload(main)
+    main.pg('server', 'username','password', 5432, 'khtaxes')
+
 
 def format_output(title, cur, headers, status, table_format):
     output = []

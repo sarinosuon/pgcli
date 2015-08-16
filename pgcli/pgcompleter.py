@@ -213,7 +213,14 @@ class PGCompleter(Completer):
                                      start_only=True)
 
         completions = []
-        suggestions = suggest_type(document.text, document.text_before_cursor)
+        parts = document.text_before_cursor.split()
+
+        if parts and parts[0] in ['?#', '??']:
+            suggestions = [{'type': 'quick_table', 'schema':[]}]
+        elif parts and parts[-1].startswith('@'):
+            suggestions = [{'type': 'quick_macros', 'schema':[]}]
+        else:
+            suggestions = suggest_type(document.text, document.text_before_cursor)
 
         for suggestion in suggestions:
 
@@ -318,6 +325,35 @@ class PGCompleter(Completer):
                     types = self.find_matches(word_before_cursor,
                                               self.datatypes, start_only=True)
                     completions.extend(types)
+
+            elif suggestion['type'] == 'quick_table':
+                text = word_before_cursor
+                text = last_word(text, include='most_punctuations').lower()
+
+                tables = self.populate_schema_objects(
+                    suggestion['schema'], 'tables')
+                all = [Completion(table, -len(text)) for table in sorted(tables) if not table.startswith('pg_') and table.startswith(text)]
+                completions.extend(all)
+
+            elif suggestion['type'] == 'quick_macros':
+                from pgcli import shared
+                text = word_before_cursor.replace("@", "")
+                macros = []
+                for name, (_lambda, _lambda_code, code) in shared.macros.iteritems():
+                    code = code.strip()[4:]
+                    p = code.find('=')
+                    if p > 0:
+                        macros.append((name, code[:p].strip()))
+                    else:
+                        macros.append((name, name))
+                macros = sorted(macros)
+                all = [Completion(name, start_position = -len(text), display=signature) for name, signature in macros if name.startswith(text)]
+                completions.extend(all)
+
+        if 0:
+            fout = open('/tmp/SUGG', 'ab')
+            fout.write(repr(parts) + "\n")
+            fout.close()
 
         return completions
 
